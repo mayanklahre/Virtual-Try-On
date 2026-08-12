@@ -205,15 +205,6 @@
 </div>
 
 <script>
-// NOTE on API_KEY below: this is only a soft gate for a public demo page —
-// anything sent from browser JS is visible to anyone who opens dev tools or
-// views page source. It stops random bots hitting /try-on directly without
-// ever loading this page, but a determined visitor can still read it here.
-// The server-side rate limit (see app.py) is the real cost backstop.
-// For a real deployment, replace this with a login/session flow instead of
-// a hardcoded key.
-const API_KEY = "PASTE-THE-SAME-KEY-YOU-PUT-IN-THE-MODAL-SECRET-HERE";
-
 let personFile = null, garmentFile = null;
 
 function previewImage(input, cardId, previewId) {
@@ -255,8 +246,7 @@ async function generate() {
   const msg     = document.getElementById('statusMsg');
   const steps   = [
     '🧠 Running human body parsing...',
-    '✂️  Building agnostic mask...',
-    '📐 Generating DensePose map...',
+    '✂️  Building clothing mask...',
     '🎨 Running diffusion inference (50 steps)...',
     '✨ Finalizing result...',
   ];
@@ -274,7 +264,6 @@ async function generate() {
   try {
     const res = await fetch('/try-on', {
       method: 'POST',
-      headers: { 'X-API-Key': API_KEY },
       body: form,
     });
     clearInterval(interval);
