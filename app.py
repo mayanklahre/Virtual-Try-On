@@ -14,15 +14,14 @@ volume = modal.Volume.from_name("vto-model-weights")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auth + rate limiting for the public web endpoint
-# The GPU function costs real money per call, so /try-on must not be left
-# open. api_secret holds a shared key; rate_limit_dict is a Modal Dict
-# (KV store shared across all container replicas — plain in-memory counters
-# would NOT be shared once Modal scales past one container).
+# The GPU function costs real money per call, so the UI and /try-on endpoint
+# both require server-side HTTP Basic authentication. Browser JavaScript never
+# receives these credentials. rate_limit_dict is shared across all replicas.
 #
 # One-time setup before deploying:
-#   modal secret create vto-api-key API_KEY=<paste-a-long-random-string-here>
+#   modal secret create vto-web-auth VTO_USERNAME=<username> VTO_PASSWORD=<password>
 # ─────────────────────────────────────────────────────────────────────────────
-api_secret = modal.Secret.from_name("vto-api-key")
+web_auth_secret = modal.Secret.from_name("vto-web-auth")
 rate_limit_dict = modal.Dict.from_name("vto-rate-limit", create_if_missing=True)
 
 RATE_LIMIT_MAX_REQUESTS   = 5     # max /try-on calls per client...
@@ -36,10 +35,9 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 # one serving it (e.g. a Shopify storefront's own domain calling this Modal
 # URL directly from browser JS, rather than loading the built-in "/" UI).
 # Kept as an explicit allow-list, not "*". CORS is enforced by the browser,
-# not the server, so it doesn't stop server-to-server abuse (the API key +
-# rate limit handle that) — but an allow-list stops a random third-party
-# site's browser JS from quietly calling this API from a visitor's browser
-# if a key ever leaked into client-side code.
+# not the server, so it does not stop server-to-server abuse. Server-side
+# authentication and rate limiting enforce that boundary; this allow-list stops
+# a random third-party site's browser JS from calling the API.
 # ─────────────────────────────────────────────────────────────────────────────
 ALLOWED_ORIGINS = [
     "https://your-store.myshopify.com",  # TODO: replace with your real storefront domain(s)
@@ -58,19 +56,17 @@ ALLOWED_ORIGINS = [
 #   NOTE: CatVTON's default branch is "edited", not "main" — confirmed via
 #   `git ls-remote https://github.com/Zheng-Chong/CatVTON.git` before picking
 #   this commit, since a naive "main"-branch assumption would've been wrong.
-CATVTON_COMMIT    = "7818397f25613beedb3d861a34769f607cfcf3b1"  # HEAD (branch: edited) as of 2026-08-12
-DETECTRON2_COMMIT = "b4a4a3bd136852dae5fb1de37978dee412653e31"  # HEAD (branch: main)   as of 2026-08-12
+CATVTON_COMMIT = "7818397f25613beedb3d861a34769f607cfcf3b1"  # HEAD (branch: edited) as of 2026-08-12
 
 vto_image = (
-    # Use CUDA 12.1 + cuDNN 8 base — required for detectron2 to compile
-    # and compatible with torch 2.1.2 (cuDNN 8.x)
+    # CUDA 12.1 + cuDNN 8 is compatible with torch 2.1.2 (cuDNN 8.x).
     modal.Image.from_registry(
         "nvidia/cuda:12.1.0-cudnn8-devel-ubuntu22.04",
         add_python="3.10",
     )
     .apt_install(
         "git", "libgl1-mesa-glx", "libglib2.0-0",
-        "wget", "gcc", "g++", "build-essential",
+        "gcc", "g++", "build-essential",
         "python3-pip",
     )
     # Layer 1: pin numpy + torch FIRST before anything else runs
@@ -105,17 +101,12 @@ vto_image = (
         "safetensors",
         "xformers==0.0.23",
     )
-    # Layer 3: compiled repos — torch is already locked so detectron2 builds cleanly
+    # Layer 3: CatVTON source — torch is already locked
     .run_commands(
         # Clone CatVTON (we skip its requirements.txt — already installed above),
         # then pin to a known-good commit instead of floating on the default branch
         f"git clone https://github.com/Zheng-Chong/CatVTON.git /root/CatVTON "
         f"&& cd /root/CatVTON && git checkout {CATVTON_COMMIT}",
-        # Build detectron2 against the locked torch 2.1.2 + CUDA 12.1, pinned commit
-        f"pip install 'git+https://github.com/facebookresearch/detectron2.git@{DETECTRON2_COMMIT}'",
-        # DensePose subproject — same pinned commit, so both installs always match
-        f"pip install 'git+https://github.com/facebookresearch/detectron2.git@{DETECTRON2_COMMIT}"
-        f"#subdirectory=projects/DensePose'",
         # Final re-pin: detectron2 sometimes pulls numpy 2.x as transitive dep
         "pip install 'numpy==1.26.4' --force-reinstall --no-deps",
     )
@@ -135,8 +126,6 @@ app = modal.App("vto-catvton", image=vto_image)
 # ─────────────────────────────────────────────────────────────────────────────
 @app.function(volumes={"/weights": volume}, timeout=7200, cpu=4)
 def download_weights():
-    import subprocess
-    import urllib.request
     from huggingface_hub import snapshot_download, hf_hub_download
 
     # ── CatVTON attention checkpoints ────────────────────────────────────────
@@ -186,33 +175,12 @@ def download_weights():
         shutil.copy(cached, f"/weights/preprocess/humanparsing/{fname}")
     print("  ✓ SCHP parsing")
 
-    # ── DensePose R50-FPN weights + configs ───────────────────────────────────
-    print("⬇️  DensePose weights + configs...")
-    os.makedirs("/weights/preprocess/densepose", exist_ok=True)
-    subprocess.run([
-        "wget", "-q", "-O",
-        "/weights/preprocess/densepose/model_final_162be9.pkl",
-        "https://dl.fbaipublicfiles.com/densepose/"
-        "densepose_rcnn_R_50_FPN_s1x/165712039/model_final_162be9.pkl",
-    ], check=True)
-    for fname, url in {
-        "Base-RCNN-FPN.yaml":
-            "https://raw.githubusercontent.com/facebookresearch/detectron2/"
-            "main/configs/Base-RCNN-FPN.yaml",
-        "densepose_rcnn_R_50_FPN_s1x.yaml":
-            "https://raw.githubusercontent.com/facebookresearch/detectron2/"
-            "main/projects/DensePose/configs/densepose_rcnn_R_50_FPN_s1x.yaml",
-    }.items():
-        urllib.request.urlretrieve(url, f"/weights/preprocess/densepose/{fname}")
-    print("  ✓ DensePose")
-
     volume.commit()
     print("\n✅ All weights saved to volume!")
     print("   CatVTON:      /weights/catvton")
     print("   SD Inpaint:   /weights/sd_inpaint")
     print("   IP-Adapter:   /weights/ip_adapter")
     print("   SCHP:         /weights/preprocess/humanparsing")
-    print("   DensePose:    /weights/preprocess/densepose")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,9 +197,7 @@ def run_vto_inference(person_bytes: bytes, garment_bytes: bytes):
     from PIL import Image
 
     sys.path.insert(0, "/root")
-    from preprocessing import (
-        human_parsing, make_agnostic, make_cloth_mask, run_densepose,
-    )
+    from preprocessing import human_parsing, make_inpaint_mask
     from inference import run_catvton
 
     W, H = 768, 1024
@@ -250,30 +216,19 @@ def run_vto_inference(person_bytes: bytes, garment_bytes: bytes):
     save_rgb(garment_bytes, garment_path)
 
     # ── Step 1: Human parsing ─────────────────────────────────────────────────
-    print("🧠 Step 1/4 — Human body parsing...")
+    print("🧠 Step 1/3 — Human body parsing...")
     parse_out  = "/tmp/vto/parse.png"
     parse_arr  = human_parsing(
         person_path, parse_out, f"{WEIGHTS}/preprocess/humanparsing"
     )
 
-    # ── Step 2: Generate clothing mask + agnostic image ───────────────────────
-    print("✂️  Step 2/4 — Generating clothing mask...")
-    mask_path      = "/tmp/vto/mask.png"
-    agnostic_path  = "/tmp/vto/agnostic.jpg"
-    make_agnostic(person_path, parse_arr, mask_path, agnostic_path)
+    # ── Step 2: Generate clothing mask ───────────────────────────────────────
+    print("✂️  Step 2/3 — Generating clothing mask...")
+    mask_path = "/tmp/vto/mask.png"
+    make_inpaint_mask(parse_arr, mask_path)
 
-    # ── Step 3: DensePose body map ────────────────────────────────────────────
-    print("📐 Step 3/4 — DensePose body map...")
-    densepose_path = "/tmp/vto/densepose.jpg"
-    run_densepose(
-        person_path, densepose_path,
-        f"{WEIGHTS}/preprocess/densepose", W, H
-    )
-
-    make_cloth_mask(garment_path, "/tmp/vto/cloth_mask.png")
-
-    # ── Step 4: CatVTON + IP-Adapter inference ────────────────────────────────
-    print("🎨 Step 4/4 — CatVTON inference (50 steps)...")
+    # ── Step 3: CatVTON inference ─────────────────────────────────────────────
+    print("🎨 Step 3/3 — CatVTON inference (50 steps)...")
     success = run_catvton(
         person_path   = person_path,
         garment_path  = garment_path,
@@ -297,14 +252,15 @@ def run_vto_inference(person_bytes: bytes, garment_bytes: bytes):
 # ─────────────────────────────────────────────────────────────────────────────
 # Web App
 # ─────────────────────────────────────────────────────────────────────────────
-@app.function(timeout=660, secrets=[api_secret])
+@app.function(timeout=660, secrets=[web_auth_secret])
 @modal.concurrent(max_inputs=10)
 @modal.asgi_app()
 def web():
     import os, io, time, secrets as pysecrets
-    from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Request
+    from fastapi import Depends, FastAPI, UploadFile, File, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import HTMLResponse, Response
+    from fastapi.security import HTTPBasic, HTTPBasicCredentials
     from PIL import Image, UnidentifiedImageError
 
     api = FastAPI(title="Virtual Try-On")
@@ -312,29 +268,39 @@ def web():
         CORSMiddleware,
         allow_origins=ALLOWED_ORIGINS,
         allow_methods=["GET", "POST"],
-        allow_headers=["X-API-Key", "Content-Type"],
-        allow_credentials=False,  # no cookies/session in use — key travels as a header
+        allow_headers=["Content-Type"],
+        allow_credentials=False,
     )
-    API_KEY = os.environ["API_KEY"]
+    WEB_USERNAME = os.environ["VTO_USERNAME"]
+    WEB_PASSWORD = os.environ["VTO_PASSWORD"]
+    http_basic = HTTPBasic()
 
-    def check_api_key(x_api_key: str | None) -> None:
-        # Timing-safe compare — avoids leaking key info via response-time differences
-        if not x_api_key or not pysecrets.compare_digest(x_api_key, API_KEY):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    def require_authenticated_user(
+        credentials: HTTPBasicCredentials = Depends(http_basic),
+    ) -> str:
+        username_matches = pysecrets.compare_digest(credentials.username, WEB_USERNAME)
+        password_matches = pysecrets.compare_digest(credentials.password, WEB_PASSWORD)
+        if not username_matches or not password_matches:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password",
+                headers={"WWW-Authenticate": "Basic"},
+            )
+        return credentials.username
 
     def check_rate_limit(request: Request) -> None:
-        # Best-effort, not perfectly atomic across simultaneous requests —
-        # good enough to stop runaway cost, not meant as precise metering.
+        # Each request atomically reserves one of five slots. Unlike a
+        # read-modify-write counter, concurrent requests cannot share a slot.
         client_ip = request.client.host if request.client else "unknown"
         window    = int(time.time() // RATE_LIMIT_WINDOW_SECONDS)
-        key       = f"{client_ip}:{window}"
-        count     = rate_limit_dict.get(key, 0)
-        if count >= RATE_LIMIT_MAX_REQUESTS:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Rate limit exceeded — max {RATE_LIMIT_MAX_REQUESTS} requests/hour",
-            )
-        rate_limit_dict.put(key, count + 1)
+        for slot in range(RATE_LIMIT_MAX_REQUESTS):
+            key = f"{client_ip}:{window}:{slot}"
+            if rate_limit_dict.put(key, True, skip_if_exists=True):
+                return
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded — max {RATE_LIMIT_MAX_REQUESTS} requests/hour",
+        )
 
     def validate_upload(data: bytes, field_name: str) -> None:
         # Size cap first — cheap check, avoids decoding huge/garbage payloads
@@ -359,7 +325,7 @@ def web():
             )
 
     @api.get("/", response_class=HTMLResponse)
-    async def ui():
+    async def ui(_: str = Depends(require_authenticated_user)):
         with open("/root/frontend/index.html") as f:
             return f.read()
 
@@ -368,9 +334,8 @@ def web():
         request: Request,
         person:  UploadFile = File(...),
         garment: UploadFile = File(...),
-        x_api_key: str | None = Header(default=None),
+        _: str = Depends(require_authenticated_user),
     ):
-        check_api_key(x_api_key)
         check_rate_limit(request)
 
         person_bytes  = await person.read()

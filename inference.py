@@ -10,6 +10,7 @@ Architecture:
 
 import os
 import sys
+from functools import lru_cache
 import numpy as np
 from PIL import Image
 
@@ -17,6 +18,7 @@ from PIL import Image
 # ─────────────────────────────────────────────────────────────────────────────
 # CatVTON pipeline loader
 # ─────────────────────────────────────────────────────────────────────────────
+@lru_cache(maxsize=1)
 def _load_pipeline(weights_dir: str):
     """
     Load CatVTON using its native pipeline class.
