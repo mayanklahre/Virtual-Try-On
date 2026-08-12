@@ -1,15 +1,6 @@
-"""
-inference.py — CatVTON + IP-Adapter + Garment Graphic Warp + Strict Bbox Composite
-─────────────────────────────────────────────────────────────────────────────────────
-Architecture:
-  1. CatVTON        — handles garment SHAPE & FIT (oversized vs fitted)
-  2. IP-Adapter     — injects garment CLIP features to preserve texture/color
-  3. Graphic warp   — homography-warps original garment onto result (preserves text/logos)
-  4. Strict bbox    — composites ONLY the clothing region; face+bg = 100% original pixels
-"""
+"""CatVTON inference with a clothing-only composite for the output."""
 
 import os
-import sys
 from functools import lru_cache
 import numpy as np
 from PIL import Image
@@ -42,76 +33,6 @@ def _load_pipeline(weights_dir: str):
     )
     print("  ✓ CatVTON pipeline loaded")
     return pipe
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Garment graphic warp — preserves text/logos that diffusion destroys
-# ─────────────────────────────────────────────────────────────────────────────
-def _warp_garment_graphic(
-    result_img: np.ndarray,
-    garment_path: str,
-    parse_arr: np.ndarray,
-    W: int,
-    H: int,
-) -> np.ndarray:
-    """
-    Warp the ORIGINAL garment image onto the generated result using a
-    perspective transform estimated from the clothing bounding boxes.
-
-    Why: diffusion models destroy text/logos (hallucination). This step
-    pastes crisp original graphics back using a purely geometric operation.
-    """
-    import cv2
-
-    garment = np.array(Image.open(garment_path).convert("RGB").resize((W, H)))
-
-    # Build clothing mask from result image and parse map
-    UPPER = {5, 6, 7}
-    clothing_mask = np.zeros(parse_arr.shape, dtype=np.uint8)
-    for lbl in UPPER:
-        clothing_mask[parse_arr == lbl] = 255
-
-    if clothing_mask.sum() == 0:
-        print("  ⚠️  Garment warp: no clothing region found, skipping")
-        return result_img
-
-    # Source bbox: garment flat-lay (approximately full image minus margins)
-    src_pts = np.float32([
-        [int(W * 0.05), int(H * 0.05)],
-        [int(W * 0.95), int(H * 0.05)],
-        [int(W * 0.95), int(H * 0.90)],
-        [int(W * 0.05), int(H * 0.90)],
-    ])
-
-    # Destination bbox: clothing region on the person
-    ys, xs = np.where(clothing_mask > 0)
-    x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
-    dst_pts = np.float32([
-        [x1, y1], [x2, y1], [x2, y2], [x1, y2]
-    ])
-
-    # Perspective transform: warp flat-lay garment to body-fitted region
-    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
-    warped = cv2.warpPerspective(garment, M, (W, H))
-
-    # Build a soft blend mask: only blend where clothing is detected
-    blend_mask = cv2.GaussianBlur(
-        clothing_mask.astype(np.float32), (15, 15), 0
-    ) / 255.0
-
-    # Only warp where the original garment has content (not background white)
-    garment_content = np.any(garment < 240, axis=2).astype(np.float32)
-    garment_content_warped = cv2.warpPerspective(garment_content, M, (W, H))
-    garment_content_warped = cv2.GaussianBlur(garment_content_warped, (11, 11), 0)
-
-    # Final blend: 60% original graphic, 40% diffusion result
-    # (full 100% warp would ignore lighting/shading from diffusion)
-    alpha = blend_mask * garment_content_warped * 0.6
-    alpha = alpha[:, :, np.newaxis]
-
-    blended = (warped * alpha + result_img * (1 - alpha)).astype(np.uint8)
-    print("  ✓ Garment graphic warped onto result")
-    return blended
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,8 +108,6 @@ def run_catvton(
     guidance: float = 2.5,
     seed: int = 42,
 ) -> bool:
-    import torch
-
     try:
         # ── Load models ───────────────────────────────────────────────────────
         pipe = _load_pipeline(weights_dir)
@@ -212,10 +131,6 @@ def run_catvton(
 
         result_arr   = np.array(result_img)
         original_arr = np.array(person_img)
-
-        # ── Warp original garment graphic onto diffusion result ───────────────
-        #print("  Warping original garment graphic (text/logo preservation)...")
-        result_arr = _warp_garment_graphic(result_arr, garment_path, parse_arr, W, H)
 
         # ── Strict bbox composite ─────────────────────────────────────────────
         print("  Applying strict bbox composite (face + bg freeze)...")

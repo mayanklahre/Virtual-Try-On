@@ -194,7 +194,7 @@ def download_weights():
 )
 def run_vto_inference(person_bytes: bytes, garment_bytes: bytes):
     import sys, io
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     sys.path.insert(0, "/root")
     from preprocessing import human_parsing, make_inpaint_mask
@@ -209,8 +209,12 @@ def run_vto_inference(person_bytes: bytes, garment_bytes: bytes):
     garment_path = "/tmp/vto/garment.jpg"
     result_path  = "/tmp/vto/result.png"
 
-    def save_rgb(data: bytes, path: str):
-        Image.open(io.BytesIO(data)).convert("RGB").resize((W, H)).save(path)
+    def save_rgb(data: bytes, path: str) -> None:
+        """Normalize uploads without turning transparent PNG pixels black."""
+        source = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGBA")
+        background = Image.new("RGBA", source.size, "white")
+        image = Image.alpha_composite(background, source).convert("RGB")
+        image.resize((W, H)).save(path)
 
     save_rgb(person_bytes,  person_path)
     save_rgb(garment_bytes, garment_path)
