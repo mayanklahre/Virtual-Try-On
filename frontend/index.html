@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Virtual Try-On</title>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #13131a;
+    --border: #2a2a3a;
+    --accent: #7c3aed;
+    --accent2: #a855f7;
+    --text: #f0f0f8;
+    --muted: #6b6b8a;
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px;
+  }
+  header { text-align: center; margin-bottom: 48px; }
+  header h1 {
+    font-size: 2.4rem;
+    font-weight: 800;
+    background: linear-gradient(135deg, #a855f7, #7c3aed, #4f46e5);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  header p { color: var(--muted); margin-top: 8px; }
+
+  .workspace {
+    width: 100%; max-width: 960px;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 24px;
+  }
+  .upload-card {
+    background: var(--surface);
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    display: flex; flex-direction: column;
+    align-items: center; gap: 16px;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    position: relative; min-height: 300px; justify-content: center;
+  }
+  .upload-card:hover, .upload-card.drag-over {
+    border-color: var(--accent); background: #1a1a2e;
+  }
+  .upload-card.has-image {
+    border-style: solid; border-color: var(--accent); padding: 0; overflow: hidden;
+  }
+  .upload-card.has-image img { width: 100%; height: 100%; object-fit: cover; border-radius: calc(var(--radius) - 2px); }
+  .upload-card .overlay {
+    position: absolute; inset: 0;
+    background: rgba(10,10,15,0.7);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 8px;
+    opacity: 0; transition: opacity 0.2s;
+    border-radius: calc(var(--radius) - 2px);
+  }
+  .upload-card.has-image:hover .overlay { opacity: 1; }
+  .upload-icon { font-size: 3rem; }
+  .upload-label { font-size: 1rem; font-weight: 600; }
+  .upload-sub { font-size: 0.8rem; color: var(--muted); }
+  input[type=file] { display: none; }
+  .card-title {
+    font-size: 0.75rem; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 1px;
+    color: var(--muted); position: absolute; top: 14px; left: 18px; z-index: 2;
+    background: var(--surface); padding: 2px 8px; border-radius: 6px;
+  }
+  .has-image .card-title { background: rgba(10,10,15,0.8); color: var(--text); }
+
+  .actions { width: 100%; max-width: 960px; margin-top: 28px; display: flex; justify-content: center; }
+  .btn-generate {
+    background: linear-gradient(135deg, var(--accent), #4f46e5);
+    color: white; border: none; padding: 16px 64px;
+    font-size: 1.05rem; font-weight: 700; border-radius: 50px;
+    cursor: pointer; transition: opacity 0.2s, transform 0.1s;
+    box-shadow: 0 8px 32px rgba(124,58,237,0.35);
+  }
+  .btn-generate:hover { opacity: 0.9; transform: translateY(-1px); }
+  .btn-generate:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+  .status { width: 100%; max-width: 960px; margin-top: 20px; text-align: center; min-height: 28px; }
+  .status-text { font-size: 0.9rem; color: var(--muted); display: flex; align-items: center; justify-content: center; gap: 10px; }
+  .spinner {
+    width: 18px; height: 18px; border: 2px solid var(--border);
+    border-top-color: var(--accent2); border-radius: 50%;
+    animation: spin 0.7s linear infinite; display: none;
+  }
+  .spinner.active { display: block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .result-section { width: 100%; max-width: 960px; margin-top: 40px; display: none; }
+  .result-section.visible { display: block; }
+  .result-section h2 {
+    font-size: 1rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 1px; color: var(--muted); margin-bottom: 16px; text-align: center;
+  }
+  .result-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  .result-img-wrap {
+    background: var(--surface); border-radius: var(--radius);
+    overflow: hidden; border: 1px solid var(--border);
+  }
+  .result-img-wrap img { width: 100%; display: block; }
+  .img-label {
+    padding: 10px 16px; font-size: 0.75rem; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 1px; color: var(--muted);
+    border-top: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .btn-dl {
+    background: transparent; border: 1px solid var(--border);
+    color: var(--text); padding: 4px 12px; border-radius: 8px;
+    font-size: 0.75rem; cursor: pointer; text-decoration: none;
+    transition: border-color 0.2s;
+  }
+  .btn-dl:hover { border-color: var(--accent); color: var(--accent2); }
+  .badge-new {
+    background: linear-gradient(135deg, var(--accent), #4f46e5);
+    color: white; font-size: 0.65rem; font-weight: 800;
+    padding: 2px 7px; border-radius: 20px;
+  }
+  @media (max-width: 600px) {
+    .workspace, .result-grid { grid-template-columns: 1fr; }
+    header h1 { font-size: 1.8rem; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>✦ Virtual Try-On</h1>
+  <p>Upload a person photo and a garment — see it worn in seconds</p>
+</header>
+
+<div class="workspace">
+  <div class="upload-card" id="personCard" onclick="document.getElementById('personInput').click()">
+    <span class="card-title">👤 Person Photo</span>
+    <input type="file" id="personInput" accept="image/*"
+           onchange="previewImage(this,'personCard','personPreview')"/>
+    <div class="upload-icon">🧍</div>
+    <div class="upload-label">Upload Person Photo</div>
+    <div class="upload-sub">Front-facing, full body preferred</div>
+    <img id="personPreview" style="display:none"/>
+    <div class="overlay">
+      <div class="upload-icon">🔄</div>
+      <div class="upload-label">Change Photo</div>
+    </div>
+  </div>
+
+  <div class="upload-card" id="garmentCard" onclick="document.getElementById('garmentInput').click()">
+    <span class="card-title">👕 Garment</span>
+    <input type="file" id="garmentInput" accept="image/*"
+           onchange="previewImage(this,'garmentCard','garmentPreview')"/>
+    <div class="upload-icon">👔</div>
+    <div class="upload-label">Upload Garment</div>
+    <div class="upload-sub">Flat lay or product image works best</div>
+    <img id="garmentPreview" style="display:none"/>
+    <div class="overlay">
+      <div class="upload-icon">🔄</div>
+      <div class="upload-label">Change Garment</div>
+    </div>
+  </div>
+</div>
+
+<div class="actions">
+  <button class="btn-generate" id="generateBtn" onclick="generate()" disabled>
+    ✦ Generate Try-On
+  </button>
+</div>
+
+<div class="status">
+  <div class="status-text" id="statusText">
+    <div class="spinner" id="spinner"></div>
+    <span id="statusMsg">Upload both images to get started</span>
+  </div>
+</div>
+
+<div class="result-section" id="resultSection">
+  <h2>Result <span class="badge-new">NEW</span></h2>
+  <div class="result-grid">
+    <div class="result-img-wrap">
+      <img id="resultImg" src="" alt="Try-on result"/>
+      <div class="img-label">
+        Virtual Try-On
+        <a id="downloadLink" class="btn-dl" download="vto_result.png">⬇ Download</a>
+      </div>
+    </div>
+    <div class="result-img-wrap">
+      <img id="personCompare" src="" alt="Original"/>
+      <div class="img-label">Original</div>
+    </div>
+  </div>
+</div>
+
+<script>
+let personFile = null, garmentFile = null;
+
+function previewImage(input, cardId, previewId) {
+  const file = input.files[0];
+  if (!file) return;
+  if (input.id === 'personInput') personFile = file;
+  else garmentFile = file;
+
+  const reader = new FileReader();
+  reader.onload = e => {
+    const card = document.getElementById(cardId);
+    const prev = document.getElementById(previewId);
+    prev.src = e.target.result;
+    prev.style.display = 'block';
+    card.classList.add('has-image');
+    [...card.querySelectorAll('.upload-icon,.upload-label,.upload-sub')]
+      .forEach(el => { if (!el.closest('.overlay')) el.style.display = 'none'; });
+    if (input.id === 'personInput')
+      document.getElementById('personCompare').src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+  checkReady();
+}
+
+function checkReady() {
+  const btn = document.getElementById('generateBtn');
+  const msg = document.getElementById('statusMsg');
+  if (personFile && garmentFile) {
+    btn.disabled = false;
+    msg.textContent = 'Ready! Click Generate Try-On';
+  } else {
+    msg.textContent = personFile ? 'Now upload a garment' : 'Now upload a person photo';
+  }
+}
+
+async function generate() {
+  const btn     = document.getElementById('generateBtn');
+  const spinner = document.getElementById('spinner');
+  const msg     = document.getElementById('statusMsg');
+  const steps   = [
+    '🧠 Running human body parsing...',
+    '✂️  Building agnostic mask...',
+    '📐 Generating DensePose map...',
+    '🎨 Running diffusion inference (50 steps)...',
+    '✨ Finalizing result...',
+  ];
+
+  btn.disabled = true;
+  spinner.classList.add('active');
+  msg.textContent = steps[0];
+  let i = 0;
+  const interval = setInterval(() => { msg.textContent = steps[++i % steps.length]; }, 8000);
+
+  const form = new FormData();
+  form.append('person',  personFile);
+  form.append('garment', garmentFile);
+
+  try {
+    const res = await fetch('/try-on', { method: 'POST', body: form });
+    clearInterval(interval);
+    if (!res.ok) throw new Error(await res.text());
+
+    const url = URL.createObjectURL(await res.blob());
+    document.getElementById('resultImg').src = url;
+    document.getElementById('downloadLink').href = url;
+    document.getElementById('resultSection').classList.add('visible');
+    msg.textContent = '✅ Done! Scroll down to see your result.';
+  } catch(e) {
+    clearInterval(interval);
+    msg.textContent = '❌ Error: ' + e.message;
+  } finally {
+    spinner.classList.remove('active');
+    btn.disabled = false;
+  }
+}
+
+// Drag-and-drop
+['personCard','garmentCard'].forEach(id => {
+  const card    = document.getElementById(id);
+  const inputId = id === 'personCard' ? 'personInput' : 'garmentInput';
+  card.addEventListener('dragover',  e => { e.preventDefault(); card.classList.add('drag-over'); });
+  card.addEventListener('dragleave', ()  => card.classList.remove('drag-over'));
+  card.addEventListener('drop', e => {
+    e.preventDefault(); card.classList.remove('drag-over');
+    const input = document.getElementById(inputId);
+    if (e.dataTransfer.files.length) {
+      input.files = e.dataTransfer.files;
+      input.dispatchEvent(new Event('change'));
+    }
+  });
+});
+</script>
+</body>
+</html>
