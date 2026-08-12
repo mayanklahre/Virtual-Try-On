@@ -13,9 +13,54 @@ import modal, os, shutil, json
 volume = modal.Volume.from_name("vto-model-weights")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Auth + rate limiting for the public web endpoint
+# The GPU function costs real money per call, so /try-on must not be left
+# open. api_secret holds a shared key; rate_limit_dict is a Modal Dict
+# (KV store shared across all container replicas — plain in-memory counters
+# would NOT be shared once Modal scales past one container).
+#
+# One-time setup before deploying:
+#   modal secret create vto-api-key API_KEY=<paste-a-long-random-string-here>
+# ─────────────────────────────────────────────────────────────────────────────
+api_secret = modal.Secret.from_name("vto-api-key")
+rate_limit_dict = modal.Dict.from_name("vto-rate-limit", create_if_missing=True)
+
+RATE_LIMIT_MAX_REQUESTS   = 5     # max /try-on calls per client...
+RATE_LIMIT_WINDOW_SECONDS = 3600  # ...per this many seconds (1 hour)
+
+MAX_UPLOAD_MB    = 10                     # per-image cap
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORS — only matters if this API is called from a DIFFERENT origin than the
+# one serving it (e.g. a Shopify storefront's own domain calling this Modal
+# URL directly from browser JS, rather than loading the built-in "/" UI).
+# Kept as an explicit allow-list, not "*". CORS is enforced by the browser,
+# not the server, so it doesn't stop server-to-server abuse (the API key +
+# rate limit handle that) — but an allow-list stops a random third-party
+# site's browser JS from quietly calling this API from a visitor's browser
+# if a key ever leaked into client-side code.
+# ─────────────────────────────────────────────────────────────────────────────
+ALLOWED_ORIGINS = [
+    "https://your-store.myshopify.com",  # TODO: replace with your real storefront domain(s)
+    "http://localhost:3000",             # local frontend dev server, if you have one
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Container image
 # Pin numpy first, then build everything else on top
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Pinned commits — an unpinned `git clone`/`pip install git+...` silently
+# picks up upstream changes on the next `modal deploy`/rebuild, which can
+# break the build with no code change on your side. Bump these deliberately
+# (see instructions) rather than letting them float.
+#   NOTE: CatVTON's default branch is "edited", not "main" — confirmed via
+#   `git ls-remote https://github.com/Zheng-Chong/CatVTON.git` before picking
+#   this commit, since a naive "main"-branch assumption would've been wrong.
+CATVTON_COMMIT    = "7818397f25613beedb3d861a34769f607cfcf3b1"  # HEAD (branch: edited) as of 2026-08-12
+DETECTRON2_COMMIT = "b4a4a3bd136852dae5fb1de37978dee412653e31"  # HEAD (branch: main)   as of 2026-08-12
+
 vto_image = (
     # Use CUDA 12.1 + cuDNN 8 base — required for detectron2 to compile
     # and compatible with torch 2.1.2 (cuDNN 8.x)
@@ -62,13 +107,15 @@ vto_image = (
     )
     # Layer 3: compiled repos — torch is already locked so detectron2 builds cleanly
     .run_commands(
-        # Clone CatVTON (we skip its requirements.txt — already installed above)
-        "git clone https://github.com/Zheng-Chong/CatVTON.git /root/CatVTON",
-        # Build detectron2 against the locked torch 2.1.2 + CUDA 12.1
-        "pip install 'git+https://github.com/facebookresearch/detectron2.git'",
-        # DensePose subproject
-        "pip install 'git+https://github.com/facebookresearch/detectron2.git"
-        "#subdirectory=projects/DensePose'",
+        # Clone CatVTON (we skip its requirements.txt — already installed above),
+        # then pin to a known-good commit instead of floating on the default branch
+        f"git clone https://github.com/Zheng-Chong/CatVTON.git /root/CatVTON "
+        f"&& cd /root/CatVTON && git checkout {CATVTON_COMMIT}",
+        # Build detectron2 against the locked torch 2.1.2 + CUDA 12.1, pinned commit
+        f"pip install 'git+https://github.com/facebookresearch/detectron2.git@{DETECTRON2_COMMIT}'",
+        # DensePose subproject — same pinned commit, so both installs always match
+        f"pip install 'git+https://github.com/facebookresearch/detectron2.git@{DETECTRON2_COMMIT}"
+        f"#subdirectory=projects/DensePose'",
         # Final re-pin: detectron2 sometimes pulls numpy 2.x as transitive dep
         "pip install 'numpy==1.26.4' --force-reinstall --no-deps",
     )
@@ -103,10 +150,13 @@ def download_weights():
     print("  ✓ CatVTON weights")
 
     # ── SD Inpainting base model (CatVTON backbone) ───────────────────────────
+    # NOTE: RunwayML deleted their HuggingFace org in Aug 2024, so
+    # "runwayml/stable-diffusion-inpainting" 404s/401s. Using the live
+    # community mirror instead (same weights, same license).
     print("⬇️  Stable Diffusion Inpainting base model (~4 GB)...")
     os.makedirs("/weights/sd_inpaint", exist_ok=True)
     snapshot_download(
-        repo_id="runwayml/stable-diffusion-inpainting",
+        repo_id="stable-diffusion-v1-5/stable-diffusion-inpainting",
         local_dir="/weights/sd_inpaint",
         ignore_patterns=["*.md", ".gitattributes", "*.ckpt"],
     )
@@ -247,14 +297,66 @@ def run_vto_inference(person_bytes: bytes, garment_bytes: bytes):
 # ─────────────────────────────────────────────────────────────────────────────
 # Web App
 # ─────────────────────────────────────────────────────────────────────────────
-@app.function(timeout=660)
+@app.function(timeout=660, secrets=[api_secret])
 @modal.concurrent(max_inputs=10)
 @modal.asgi_app()
 def web():
-    from fastapi import FastAPI, UploadFile, File, HTTPException
+    import os, io, time, secrets as pysecrets
+    from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Request
+    from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import HTMLResponse, Response
+    from PIL import Image, UnidentifiedImageError
 
     api = FastAPI(title="Virtual Try-On")
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_methods=["GET", "POST"],
+        allow_headers=["X-API-Key", "Content-Type"],
+        allow_credentials=False,  # no cookies/session in use — key travels as a header
+    )
+    API_KEY = os.environ["API_KEY"]
+
+    def check_api_key(x_api_key: str | None) -> None:
+        # Timing-safe compare — avoids leaking key info via response-time differences
+        if not x_api_key or not pysecrets.compare_digest(x_api_key, API_KEY):
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    def check_rate_limit(request: Request) -> None:
+        # Best-effort, not perfectly atomic across simultaneous requests —
+        # good enough to stop runaway cost, not meant as precise metering.
+        client_ip = request.client.host if request.client else "unknown"
+        window    = int(time.time() // RATE_LIMIT_WINDOW_SECONDS)
+        key       = f"{client_ip}:{window}"
+        count     = rate_limit_dict.get(key, 0)
+        if count >= RATE_LIMIT_MAX_REQUESTS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded — max {RATE_LIMIT_MAX_REQUESTS} requests/hour",
+            )
+        rate_limit_dict.put(key, count + 1)
+
+    def validate_upload(data: bytes, field_name: str) -> None:
+        # Size cap first — cheap check, avoids decoding huge/garbage payloads
+        if len(data) == 0:
+            raise HTTPException(status_code=400, detail=f"{field_name}: file is empty")
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{field_name}: exceeds {MAX_UPLOAD_MB}MB limit",
+            )
+        # Actually decode it — a spoofed Content-Type header would sail past
+        # a content_type check, so verify the bytes are a real image instead.
+        # Image.verify() also trips PIL's built-in DecompressionBombError
+        # guard against absurd pixel-dimension "zip bomb" style images.
+        try:
+            img = Image.open(io.BytesIO(data))
+            img.verify()
+        except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name}: not a valid image ({e.__class__.__name__})",
+            )
 
     @api.get("/", response_class=HTMLResponse)
     async def ui():
@@ -263,11 +365,18 @@ def web():
 
     @api.post("/try-on")
     async def try_on(
+        request: Request,
         person:  UploadFile = File(...),
         garment: UploadFile = File(...),
+        x_api_key: str | None = Header(default=None),
     ):
+        check_api_key(x_api_key)
+        check_rate_limit(request)
+
         person_bytes  = await person.read()
         garment_bytes = await garment.read()
+        validate_upload(person_bytes,  "person photo")
+        validate_upload(garment_bytes, "garment image")
         # .aio() = non-blocking async Modal remote call (required inside async FastAPI)
         result = await run_vto_inference.remote.aio(person_bytes, garment_bytes)
         if result is None:
